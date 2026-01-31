@@ -104,6 +104,329 @@ Testing complex collaboration applications (Slack-like, project management tools
 
 ---
 
+## Key Design Decisions
+
+### Handling Incomplete User Stories
+
+When user stories or acceptance criteria are incomplete, the system uses a **hybrid approach**:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Story Curation Workflow                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. EXPLORATION PHASE                                               │
+│     └─→ Crawler discovers UI elements and flows                     │
+│                                                                     │
+│  2. LLM INFERENCE                                                   │
+│     └─→ LLM analyzes discovered flows                               │
+│     └─→ Generates draft user stories with acceptance criteria       │
+│     └─→ Maps inferred stories to discovered states                  │
+│                                                                     │
+│  3. HUMAN REVIEW (Required before test generation)                  │
+│     └─→ Review drafted stories in approval queue                    │
+│     └─→ Edit, approve, or reject each story                         │
+│     └─→ Add missing context or edge cases                           │
+│                                                                     │
+│  4. TEST GENERATION                                                 │
+│     └─→ Only approved stories used for test generation              │
+│     └─→ Unapproved flows marked for re-exploration                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+```python
+@dataclass
+class DraftUserStory:
+    id: str
+    title: str
+    description: str
+    acceptance_criteria: List[str]
+    inferred_from: List[str]  # State IDs that informed this story
+    confidence: float  # LLM confidence score
+    status: str  # "draft", "approved", "rejected", "needs_revision"
+    reviewer_notes: Optional[str]
+
+class StoryCurator:
+    def infer_stories_from_graph(graph: StateGraph) -> List[DraftUserStory]
+    def get_pending_review() -> List[DraftUserStory]
+    def approve_story(story_id: str, revisions: Optional[Dict]) -> UserStory
+    def reject_story(story_id: str, reason: str) -> None
+```
+
+### LLM Provider Resilience
+
+The system uses a **retry-then-failover** strategy leveraging the existing `UnifiedLLMClient` library:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    LLM Resilience Strategy                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  REQUEST                                                            │
+│     │                                                               │
+│     ▼                                                               │
+│  ┌─────────────────┐                                                │
+│  │ Primary Provider│ (e.g., Claude)                                 │
+│  └────────┬────────┘                                                │
+│           │                                                         │
+│      [Success?]───Yes──→ Return Response                            │
+│           │                                                         │
+│          No (Rate limit / Error)                                    │
+│           │                                                         │
+│           ▼                                                         │
+│  ┌─────────────────┐                                                │
+│  │ Exponential     │ Retry up to 3x with backoff                    │
+│  │ Backoff Retry   │ (1s, 2s, 4s delays)                            │
+│  └────────┬────────┘                                                │
+│           │                                                         │
+│      [Success?]───Yes──→ Return Response                            │
+│           │                                                         │
+│          No (Persistent failure)                                    │
+│           │                                                         │
+│           ▼                                                         │
+│  ┌─────────────────┐                                                │
+│  │ Failover Chain  │ OpenRouter → OpenAI → Local (Ollama)           │
+│  └────────┬────────┘                                                │
+│           │                                                         │
+│      [Success?]───Yes──→ Return Response + Log Provider Switch      │
+│           │                                                         │
+│          No (All providers failed)                                  │
+│           │                                                         │
+│           ▼                                                         │
+│  ┌─────────────────┐                                                │
+│  │ Checkpoint &    │ Save state, pause run, alert operator          │
+│  │ Alert           │                                                │
+│  └─────────────────┘                                                │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Integration with UnifiedLLMClient:**
+
+AutoQA will leverage the existing `UnifiedLLMClient` library from `~/Development/Scripts/UnifiedLLMClient` which provides:
+- `BaseLLMClient` abstract interface with `chat()`, `generate()`, `stream_chat()`
+- `LLMClientFactory` for provider selection
+- Built-in support for: Claude, OpenAI, Gemini, Qwen (Ollama), OpenRouter, DeepSeek
+
+```python
+from llm_client import LLMClientFactory
+
+class ResilientLLMEngine:
+    def __init__(self, config: dict):
+        self.provider_chain = config.get('failover_chain', [
+            'claude', 'openrouter', 'openai', 'qwen'
+        ])
+        self.max_retries = config.get('max_retries', 3)
+        self.checkpoint_path = config.get('checkpoint_path', './checkpoints')
+
+    def complete(self, prompt: str, **kwargs) -> str:
+        for provider_name in self.provider_chain:
+            client = LLMClientFactory.create(provider=provider_name)
+            for attempt in range(self.max_retries):
+                try:
+                    return client.generate(prompt, **kwargs)
+                except RateLimitError:
+                    delay = 2 ** attempt
+                    time.sleep(delay)
+                except Exception as e:
+                    log.warning(f"{provider_name} failed: {e}")
+                    break  # Try next provider
+
+        # All providers failed - checkpoint and alert
+        self._save_checkpoint()
+        raise AllProvidersFailedError("LLM unavailable, run checkpointed")
+```
+
+### CI/CD Integration Strategy
+
+The system supports multiple CI modes with bounded exploration for predictable run times:
+
+| Mode | Trigger | Exploration | Test Scope | Time Budget |
+|------|---------|-------------|------------|-------------|
+| **PR Smoke** | Pull request | None (use cached graph) | Critical path + changed areas | 5-10 min |
+| **Nightly Full** | Scheduled (midnight) | Full re-exploration | Exhaustive test suite | 2-4 hours |
+| **Weekly Deep** | Scheduled (weekend) | Deep + edge cases | All permutations + visual regression | 8+ hours |
+
+**Bounding Exploration for CI:**
+
+```yaml
+# ci-profiles.yaml
+
+profiles:
+  pr_smoke:
+    exploration:
+      enabled: false  # Use cached state graph
+      fallback_if_stale_hours: 24
+    tests:
+      filter_tags: ["critical", "smoke"]
+      max_tests: 50
+      parallel_workers: 8
+    timeout_minutes: 10
+
+  nightly:
+    exploration:
+      enabled: true
+      max_depth: 8
+      max_states: 300
+      timeout_minutes: 45
+    tests:
+      filter_tags: null  # Run all
+      parallel_workers: 4
+    timeout_minutes: 180
+
+  weekly_deep:
+    exploration:
+      enabled: true
+      max_depth: 15
+      max_states: 1000
+      include_edge_cases: true
+      timeout_minutes: 120
+    tests:
+      filter_tags: null
+      include_visual_regression: true
+      parallel_workers: 2  # Headed browsers need more resources
+    timeout_minutes: 480
+```
+
+**GitHub Actions Example:**
+
+```yaml
+name: AutoQA Tests
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 0 * * *'  # Nightly at midnight
+    - cron: '0 2 * * 0'  # Weekly Sunday 2am
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine CI Profile
+        id: profile
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "profile=pr_smoke" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" == "0 0 * * *" ]; then
+            echo "profile=nightly" >> $GITHUB_OUTPUT
+          else
+            echo "profile=weekly_deep" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run AutoQA
+        run: |
+          python -m autoqa run --profile ${{ steps.profile.outputs.profile }}
+```
+
+### Browser Mode Configuration
+
+Playwright runs in configurable headed/headless mode based on environment:
+
+```yaml
+# autoqa.config.yaml
+
+browser:
+  # Mode options: "headless", "headed", "auto"
+  # "auto" = headless in CI, headed locally
+  mode: "auto"
+
+  # Headed mode settings (for exploration/debugging)
+  headed:
+    slow_mo: 100  # ms delay between actions
+    viewport: { width: 1920, height: 1080 }
+    devtools: false
+
+  # Headless mode settings (for CI/speed)
+  headless:
+    viewport: { width: 1280, height: 720 }
+
+  # Screenshot settings differ by mode
+  screenshots:
+    headless:
+      full_page: false  # Faster
+      quality: 80
+    headed:
+      full_page: true  # Better for visual debugging
+      quality: 100
+```
+
+```python
+class BrowserManager:
+    def __init__(self, config: dict):
+        self.mode = self._resolve_mode(config.get('mode', 'auto'))
+        self.settings = config.get(self.mode, {})
+
+    def _resolve_mode(self, mode: str) -> str:
+        if mode == 'auto':
+            return 'headless' if os.getenv('CI') else 'headed'
+        return mode
+
+    def create_browser(self) -> Browser:
+        return playwright.chromium.launch(
+            headless=(self.mode == 'headless'),
+            slow_mo=self.settings.get('slow_mo', 0)
+        )
+```
+
+### Fallback Test Strategy
+
+Before tackling multi-user orchestration, establish a reliable fallback test set:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Fallback Test Architecture                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  TIER 1: Static Baseline Tests (Always run, never LLM-generated)   │
+│  ─────────────────────────────────────────────────────────────────  │
+│  • Hand-written critical path tests                                 │
+│  • Login/logout flows                                               │
+│  • Core CRUD operations                                             │
+│  • Stored in: tests/baseline/                                       │
+│                                                                     │
+│  TIER 2: Cached Generated Tests (Run if exploration unavailable)   │
+│  ─────────────────────────────────────────────────────────────────  │
+│  • Last successful LLM-generated test suite                         │
+│  • Versioned with git, updated nightly                              │
+│  • Stored in: tests/generated/cached/                               │
+│                                                                     │
+│  TIER 3: Fresh Generated Tests (Run when exploration succeeds)     │
+│  ─────────────────────────────────────────────────────────────────  │
+│  • Newly generated from current state graph                         │
+│  • May include new flows discovered                                 │
+│  • Stored in: tests/generated/latest/                               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Storage Strategy:**
+
+```
+tests/
+├── baseline/                    # Hand-written, version controlled
+│   ├── test_auth.py
+│   ├── test_core_crud.py
+│   └── test_critical_paths.py
+├── generated/
+│   ├── cached/                  # Last known good generated tests
+│   │   ├── test_suite_v1.2.json
+│   │   └── .generation_metadata.json
+│   └── latest/                  # Most recent generation (may be unstable)
+│       └── test_suite_latest.json
+├── snapshots/                   # State graph snapshots
+│   ├── graph_2024-01-15.json
+│   └── graph_latest.json
+└── baselines/                   # Visual regression baselines
+    └── screenshots/
+```
+
+---
+
 ## Module Specifications
 
 ### 1. Exploration Engine
@@ -212,31 +535,91 @@ class Transition:
 
 **Purpose:** Provide AI capabilities for test generation, exploration guidance, and failure analysis.
 
-#### 3.1 Provider Adapter (Pluggable)
+#### 3.1 Provider Adapter (via UnifiedLLMClient)
+
+AutoQA integrates with the existing `UnifiedLLMClient` library for provider abstraction:
 
 ```python
-# Abstract interface for LLM providers:
+# UnifiedLLMClient provides BaseLLMClient with:
+# - chat(messages) -> str
+# - generate(prompt) -> str
+# - stream_chat(messages) -> Iterator[str]
+# - get_embedding(text) -> List[float]  (select providers)
 
-class LLMProvider(ABC):
-    @abstractmethod
-    def complete(prompt: str, max_tokens: int) -> str
+from llm_client import LLMClientFactory, BaseLLMClient
 
-    @abstractmethod
-    def analyze_image(image_path: str, prompt: str) -> str
+# Supported providers via LLMClientFactory:
+# - claude / anthropic
+# - openai
+# - gemini / google
+# - qwen / ollama (local)
+# - openrouter (access to 100+ models)
+# - deepseek / deepseek-r1
 
-# Implementations:
-class ClaudeProvider(LLMProvider): ...
-class OpenAIProvider(LLMProvider): ...
-class OllamaProvider(LLMProvider): ...  # For local models
+class AutoQALLMEngine:
+    """Wraps UnifiedLLMClient with AutoQA-specific resilience and caching."""
 
-# Configuration:
-llm_config = {
-    "provider": "claude",  # or "openai", "ollama"
-    "model": "claude-sonnet-4-20250514",
-    "api_key_env": "ANTHROPIC_API_KEY",
-    "max_tokens": 4096,
-    "temperature": 0.2
-}
+    def __init__(self, config_path: str = None):
+        self.config_path = config_path
+        self.cache = {}  # Simple response cache
+
+    def get_client(self, provider: str = None) -> BaseLLMClient:
+        return LLMClientFactory.create(
+            provider=provider,
+            config_path=self.config_path
+        )
+
+    def complete_with_retry(
+        self,
+        prompt: str,
+        provider_chain: List[str] = ['claude', 'openrouter', 'openai', 'qwen'],
+        max_retries: int = 3
+    ) -> str:
+        """Complete with automatic retry and failover."""
+        for provider in provider_chain:
+            client = self.get_client(provider)
+            for attempt in range(max_retries):
+                try:
+                    return client.generate(prompt)
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                    else:
+                        log.warning(f"{provider} failed after {max_retries} retries")
+                        break
+        raise AllProvidersFailedError()
+
+    def analyze_screenshot(self, image_path: str, prompt: str) -> str:
+        """Analyze screenshot using vision-capable model."""
+        # Use Claude or GPT-4V for vision tasks
+        client = self.get_client('claude')
+        # Implementation depends on provider's vision API
+        pass
+```
+
+**Configuration via ~/.llm_config.yaml:**
+
+```yaml
+default_provider: claude
+
+providers:
+  claude:
+    model: claude-sonnet-4-20250514
+    temperature: 0.2
+    max_tokens: 4096
+
+  openrouter:
+    model: anthropic/claude-3.5-sonnet
+    temperature: 0.2
+
+  openai:
+    model: gpt-4-turbo
+    temperature: 0.2
+
+  qwen:  # Local fallback via Ollama
+    base_url: http://localhost:11434/v1
+    model: qwen2.5:32b
+    temperature: 0.7
 ```
 
 #### 3.2 Test Generator
@@ -694,13 +1077,16 @@ class FeedbackLoop:
 |----------|------------|---------|
 | **Browser Automation** | Playwright (Python) | UI interaction, multi-context, WS interception |
 | **Test Framework** | pytest | Test organization, fixtures, assertions |
-| **LLM Integration** | LangChain or direct API | Provider abstraction, prompt management |
+| **LLM Integration** | UnifiedLLMClient (internal) | Provider abstraction with failover (Claude, OpenRouter, OpenAI, Ollama) |
 | **Data Generation** | Faker | Realistic test data |
 | **Graph Storage** | NetworkX + JSON | State graph representation |
 | **Visualization** | Graphviz, Mermaid | Flow diagrams |
 | **Reporting** | Allure, pytest-html | Test result visualization |
-| **Visual Regression** | Pixelmatch, percy | Screenshot comparison |
+| **Visual Regression** | Pixelmatch, playwright-visual | Screenshot comparison |
 | **Configuration** | Pydantic, YAML | Type-safe config management |
+
+**Internal Dependencies:**
+- `UnifiedLLMClient` from `~/Development/Scripts/UnifiedLLMClient` - LLM provider abstraction
 
 ---
 
@@ -790,25 +1176,90 @@ reporting:
 
 ---
 
+## Resolved Questions
+
+| Question | Resolution |
+|----------|------------|
+| Incomplete user stories | Hybrid approach: LLM infers drafts, humans approve before test gen |
+| LLM provider failures | Retry with backoff, then failover chain via UnifiedLLMClient |
+| CI integration | Multi-profile: PR smoke (5-10min), nightly (2-4hr), weekly deep (8hr+) |
+| Headed vs headless | Configurable per environment, auto-detect CI |
+| Fallback test strategy | 3-tier: baseline (hand-written) → cached generated → fresh generated |
+
 ## Open Questions
 
 1. **Test Prioritization:** How should we rank which generated tests to run first?
+   - Options: Risk-based, recently-changed areas, historical failure rate
+
 2. **Baseline Management:** How do we handle visual regression baselines when UI intentionally changes?
+   - Need approval workflow for baseline updates
+
 3. **Conflict Resolution Testing:** How deep should we go into concurrent edit scenarios?
+   - Start with basic (2 users, same object) and expand based on app complexity
+
 4. **Error Injection:** Should we test network failures, slow connections, etc.?
+   - Consider Playwright's network interception for chaos testing
+
 5. **Accessibility Testing:** Should this be integrated into the assertion engine?
+   - Could add axe-core integration for a11y checks
+
+6. **State Graph Persistence:** Should the graph be stored in a database for large apps?
+   - JSON/NetworkX may not scale beyond 1000+ states
 
 ---
 
 ## Next Steps
 
-1. [ ] Set up project structure with core modules
-2. [ ] Implement basic Playwright crawler
-3. [ ] Build state fingerprinting with fast hash
-4. [ ] Create LLM provider abstraction layer
-5. [ ] Develop simple test generator with Claude
-6. [ ] Build test executor with pytest integration
-7. [ ] Add multi-user context management
-8. [ ] Implement WebSocket interception for real-time tests
-9. [ ] Create Allure reporting integration
-10. [ ] Document API and create usage examples
+### Immediate Priorities (Prototype Phase)
+
+Based on codex recommendations, prioritize validating core assumptions before building full system:
+
+1. [ ] **Prototype state graph + fingerprinting** with a simple app
+   - Build minimal crawler that discovers states
+   - Implement fast hash fingerprinting
+   - Test deduplication logic thoroughly
+   - Validate that state representation is sufficient
+
+2. [ ] **Decide headed vs headless strategy** and document infrastructure requirements
+   - Test screenshot fidelity in both modes
+   - Benchmark performance difference
+   - Set up configurable mode in early code
+
+3. [ ] **Establish fallback test set and storage**
+   - Create `tests/baseline/` with hand-written critical tests
+   - Set up `tests/generated/cached/` structure
+   - Implement test versioning strategy
+
+### Phase 1: Foundation
+
+4. [ ] Set up project structure with core modules
+5. [ ] Integrate UnifiedLLMClient for provider abstraction
+6. [ ] Implement basic Playwright crawler with element detection
+7. [ ] Build state graph storage with NetworkX
+8. [ ] Develop simple test generator prompts
+9. [ ] Build test executor with pytest integration
+10. [ ] Add console + JSON reporting
+
+### Phase 2: Multi-User & CI
+
+11. [ ] Add multi-user context management
+12. [ ] Implement WebSocket interception for real-time tests
+13. [ ] Create CI profiles (PR smoke, nightly, weekly)
+14. [ ] Set up GitHub Actions workflows
+15. [ ] Implement story curation workflow (LLM draft → human approve)
+
+### Phase 3: Intelligence
+
+16. [ ] Add LLM-guided exploration prioritization
+17. [ ] Implement hybrid fingerprinting with semantic verification
+18. [ ] Build failure analyzer with root cause detection
+19. [ ] Create feedback loop for gap detection
+20. [ ] Add visual regression with baseline management
+
+### Phase 4: Production
+
+21. [ ] Create Allure reporting integration
+22. [ ] Add parallel execution across workers
+23. [ ] Document API and create usage examples
+24. [ ] Test on 3+ different web applications
+25. [ ] Write user guide and onboarding documentation
