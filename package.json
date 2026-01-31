@@ -1,0 +1,27 @@
+{
+  "name": "autoqa",
+  "version": "1.0.0",
+  "description": "An automated testing framework for running and managing test suites.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FocusedDiversity/AutoQA.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/FocusedDiversity/AutoQA/issues"
+  },
+  "homepage": "https://github.com/FocusedDiversity/AutoQA#readme",
+  "dependencies": {
+    "@claude-flow/plugin-agentic-qe": "^3.0.0-alpha.4"
+  }
+}

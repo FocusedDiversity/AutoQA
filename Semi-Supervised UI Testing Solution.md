@@ -13,6 +13,85 @@ A scalable, LLM-powered framework for automated UI testing of complex web applic
 
 ---
 
+## Claude-Flow Integration
+
+AutoQA is built on top of **Claude-Flow v3**, an enterprise AI orchestration platform that provides multi-agent swarm coordination, self-learning capabilities, and native Claude Code integration.
+
+### Why Claude-Flow?
+
+| Capability | Benefit for AutoQA |
+|------------|-------------------|
+| **60+ Specialized Agents** | Use existing tester, reviewer, security agents |
+| **Swarm Coordination** | Orchestrate exploration with queen/worker pattern |
+| **Hive Mind Consensus** | Byzantine fault-tolerant state equivalence decisions |
+| **HNSW Memory** | 150x faster pattern retrieval for fingerprinting |
+| **Self-Learning (SONA)** | System learns which test patterns work best |
+| **MCP Integration** | 175+ tools accessible from Claude Code |
+
+### Custom AutoQA Agents
+
+Located in `.claude/agents/autoqa/`:
+
+| Agent | Type | Purpose |
+|-------|------|---------|
+| `exploration-queen` | Queen Coordinator | Orchestrates the exploration swarm |
+| `ui-explorer` | Crawler | Playwright-based UI discovery |
+| `state-fingerprinter` | Analyzer | Hybrid hash + LLM state deduplication |
+| `test-generator` | Generator | LLM-powered test script creation |
+| `realtime-validator` | Validator | WebSocket and multi-user sync testing |
+| `story-curator` | Curator | User story inference and approval workflow |
+
+### Swarm Architecture
+
+```
+                         👑 exploration-queen
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+       🔍 ui-explorer    🔐 state-           ✍️ test-generator
+            │             fingerprinter            │
+            │                   │                   │
+            └───────────────────┼───────────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+             ⚡ realtime-            📋 story-curator
+                validator
+```
+
+### Usage
+
+```bash
+# Initialize swarm for exploration
+npx claude-flow@v3alpha swarm init --topology hierarchical --max-agents 8
+
+# Spawn the exploration queen
+npx claude-flow@v3alpha agent spawn -t exploration-queen --name autoqa-queen
+
+# Or use via Claude Code Task tool
+Task({
+  prompt: "Explore the app at https://myapp.com and generate tests",
+  subagent_type: "exploration-queen",
+  run_in_background: true
+})
+```
+
+### Plugins
+
+AutoQA includes the **Agentic-QE plugin** for additional testing capabilities:
+
+```bash
+npm install @claude-flow/plugin-agentic-qe
+```
+
+Provides:
+- 58 specialized QE agents
+- TDD workflows with `aqe/tdd-cycle`
+- Coverage analysis with `aqe/analyze-coverage`
+- Security scanning with `aqe/security-scan`
+
+---
+
 ## Problem Statement
 
 Testing complex collaboration applications (Slack-like, project management tools, etc.) presents unique challenges:
@@ -1075,6 +1154,7 @@ class FeedbackLoop:
 
 | Category | Technology | Purpose |
 |----------|------------|---------|
+| **Agent Orchestration** | Claude-Flow v3 | Multi-agent swarms, self-learning, MCP integration |
 | **Browser Automation** | Playwright (Python) | UI interaction, multi-context, WS interception |
 | **Test Framework** | pytest | Test organization, fixtures, assertions |
 | **LLM Integration** | UnifiedLLMClient (internal) | Provider abstraction with failover (Claude, OpenRouter, OpenAI, Ollama) |
@@ -1087,6 +1167,8 @@ class FeedbackLoop:
 
 **Internal Dependencies:**
 - `UnifiedLLMClient` from `~/Development/Scripts/UnifiedLLMClient` - LLM provider abstraction
+- `claude-flow` v3 - Agent orchestration framework
+- `@claude-flow/plugin-agentic-qe` - Quality engineering agents
 
 ---
 
