@@ -7,6 +7,9 @@ Commands:
     execute     Execute generated tests
     analyze     Analyze test coverage
     report      Generate test reports
+    live        Interactive testing against live web applications
+    mock        Testing with built-in mock web application
+    mock-server Start mock web server standalone
 """
 
 import argparse
@@ -378,6 +381,158 @@ def cmd_report(args):
     return 0
 
 
+def cmd_live(args):
+    """Run live web application testing."""
+    from src.cli.live import LiveTestConfig, LiveTestRunner, run_interactive
+
+    config = LiveTestConfig(
+        base_url=args.url,
+        headless=not args.visible,
+        slow_mo=args.slow_mo,
+        timeout_ms=args.timeout * 1000,
+        screenshots_dir=args.screenshots_dir,
+        video_dir=args.video_dir if args.record_video else None,
+        trace_dir=args.trace_dir if args.trace else None,
+        storage_state=args.storage_state
+    )
+
+    if args.interactive:
+        run_interactive(config)
+        return 0
+
+    if args.replay:
+        runner = LiveTestRunner(config)
+        try:
+            runner.start()
+            results = runner.replay_actions(args.replay)
+            logger.info(f"Replay: {results['passed']} passed, {results['failed']} failed")
+            return 0 if results['failed'] == 0 else 1
+        finally:
+            runner.stop()
+
+    # Default: just start and take a screenshot
+    runner = LiveTestRunner(config)
+    try:
+        url = runner.start()
+        logger.info(f"Connected to: {url}")
+        screenshot = runner.screenshot("initial")
+        logger.info(f"Screenshot saved: {screenshot}")
+
+        if args.output:
+            runner.save_actions(args.output)
+
+        return 0
+    finally:
+        runner.stop()
+
+
+def cmd_mock(args):
+    """Run mock web application testing."""
+    from src.cli.mock import MockTestConfig, MockTestRunner, run_mock_tests, run_interactive_mock
+
+    config = MockTestConfig(
+        scenario=args.scenario,
+        host=args.host,
+        port=args.port,
+        headless=not args.visible,
+        slow_mo=args.slow_mo,
+        screenshots_dir=args.screenshots_dir,
+        auto_explore=args.explore
+    )
+
+    if args.interactive:
+        run_interactive_mock(config)
+        return 0
+
+    # Run tests
+    summary = run_mock_tests(config)
+
+    # Save results
+    if args.output:
+        runner = MockTestRunner(config)
+        runner._results = summary.get("results", [])
+        runner.save_results(args.output)
+
+    return 0 if summary.get("failed", 0) == 0 else 1
+
+
+def cmd_mock_server(args):
+    """Start mock web server standalone."""
+    from src.mock.server import MockServer, MockServerConfig
+    from src.mock.scenarios import ScenarioManager
+
+    manager = ScenarioManager()
+
+    # Load scenario
+    if Path(args.scenario).exists():
+        scenario = manager.load_from_file(args.scenario)
+    else:
+        scenario = manager.get(args.scenario)
+
+    if not scenario:
+        logger.error(f"Scenario not found: {args.scenario}")
+        logger.info(f"Available: {', '.join(manager.list_scenarios())}")
+        return 1
+
+    config = MockServerConfig(
+        host=args.host,
+        port=args.port,
+        debug=args.debug
+    )
+
+    server = MockServer(scenario=scenario, config=config)
+
+    logger.info(f"Starting mock server: {args.scenario}")
+    logger.info(f"URL: http://{args.host}:{args.port}")
+    logger.info("Press Ctrl+C to stop")
+
+    try:
+        server.start(background=False)
+    except KeyboardInterrupt:
+        logger.info("\nServer stopped")
+
+    return 0
+
+
+def cmd_scenarios(args):
+    """List or create mock scenarios."""
+    from src.mock.scenarios import ScenarioManager
+
+    manager = ScenarioManager()
+
+    if args.list:
+        print("\nAvailable scenarios:")
+        for name in manager.list_scenarios():
+            scenario = manager.get(name)
+            print(f"  {name}: {scenario.description}")
+        return 0
+
+    if args.create:
+        scenario = manager.create_scenario(
+            name=args.create,
+            template=args.template,
+            description=args.description or ""
+        )
+        output = manager.save_scenario(scenario, args.output)
+        logger.info(f"Scenario created: {output}")
+        return 0
+
+    if args.info:
+        scenario = manager.get(args.info)
+        if scenario:
+            print(f"\nScenario: {scenario.name}")
+            print(f"Description: {scenario.description}")
+            print(f"Pages: {len(scenario.pages)}")
+            print(f"Handlers: {len(scenario.handlers)}")
+            print(f"WebSocket: {'Yes' if scenario.websocket_enabled else 'No'}")
+            print(f"Users: {', '.join(scenario.users) if scenario.users else 'single-user'}")
+        else:
+            logger.error(f"Scenario not found: {args.info}")
+            return 1
+
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AutoQA - LLM-Powered Semi-Supervised UI Testing Framework",
@@ -442,6 +597,70 @@ def main():
     report_parser.add_argument("--output-dir", default="allure-report")
     report_parser.add_argument("--open", action="store_true", help="Open report in browser")
     report_parser.set_defaults(func=cmd_report)
+
+    # Live testing command
+    live_parser = subparsers.add_parser("live", help="Interactive testing against live web apps")
+    live_parser.add_argument("url", help="URL of the web application")
+    live_parser.add_argument("-i", "--interactive", action="store_true",
+                             help="Run in interactive mode")
+    live_parser.add_argument("--visible", action="store_true",
+                             help="Show browser window (non-headless)")
+    live_parser.add_argument("--slow-mo", type=int, default=0,
+                             help="Slow down actions by ms")
+    live_parser.add_argument("--timeout", type=int, default=30,
+                             help="Default timeout in seconds")
+    live_parser.add_argument("--screenshots-dir", default="screenshots/live",
+                             help="Screenshots directory")
+    live_parser.add_argument("--record-video", action="store_true",
+                             help="Record video of session")
+    live_parser.add_argument("--video-dir", default="videos",
+                             help="Video output directory")
+    live_parser.add_argument("--trace", action="store_true",
+                             help="Capture Playwright trace")
+    live_parser.add_argument("--trace-dir", default="traces",
+                             help="Trace output directory")
+    live_parser.add_argument("--storage-state", help="Browser storage state file")
+    live_parser.add_argument("--replay", help="Replay actions from JSON file")
+    live_parser.add_argument("-o", "--output", help="Save recorded actions to file")
+    live_parser.set_defaults(func=cmd_live)
+
+    # Mock testing command
+    mock_parser = subparsers.add_parser("mock", help="Testing with mock web application")
+    mock_parser.add_argument("--scenario", default="login",
+                             help="Scenario name or path to custom scenario JSON")
+    mock_parser.add_argument("-i", "--interactive", action="store_true",
+                             help="Run in interactive mode")
+    mock_parser.add_argument("--host", default="127.0.0.1", help="Server host")
+    mock_parser.add_argument("--port", type=int, default=5000, help="Server port")
+    mock_parser.add_argument("--visible", action="store_true",
+                             help="Show browser window")
+    mock_parser.add_argument("--slow-mo", type=int, default=0,
+                             help="Slow down actions by ms")
+    mock_parser.add_argument("--screenshots-dir", default="screenshots/mock",
+                             help="Screenshots directory")
+    mock_parser.add_argument("--explore", action="store_true",
+                             help="Auto-explore before running tests")
+    mock_parser.add_argument("-o", "--output", help="Save results to file")
+    mock_parser.set_defaults(func=cmd_mock)
+
+    # Mock server standalone command
+    server_parser = subparsers.add_parser("mock-server", help="Start mock server standalone")
+    server_parser.add_argument("--scenario", default="login",
+                               help="Scenario to serve")
+    server_parser.add_argument("--host", default="127.0.0.1", help="Server host")
+    server_parser.add_argument("--port", type=int, default=5000, help="Server port")
+    server_parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    server_parser.set_defaults(func=cmd_mock_server)
+
+    # Scenarios management command
+    scenarios_parser = subparsers.add_parser("scenarios", help="Manage mock scenarios")
+    scenarios_parser.add_argument("--list", action="store_true", help="List available scenarios")
+    scenarios_parser.add_argument("--info", help="Show scenario details")
+    scenarios_parser.add_argument("--create", help="Create new scenario with name")
+    scenarios_parser.add_argument("--template", help="Base template for new scenario")
+    scenarios_parser.add_argument("--description", help="Scenario description")
+    scenarios_parser.add_argument("-o", "--output", help="Output path for created scenario")
+    scenarios_parser.set_defaults(func=cmd_scenarios)
 
     args = parser.parse_args()
 

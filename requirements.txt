@@ -29,3 +29,9 @@ pillow>=10.0.0
 
 # Reporting
 allure-pytest>=2.13.0
+
+# Mock server
+flask>=3.0.0
+flask-socketio>=5.3.0
+python-socketio>=5.10.0
+eventlet>=0.35.0
